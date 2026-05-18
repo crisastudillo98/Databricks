@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import logging
 import argparse
 from abc import ABC, abstractmethod
@@ -26,32 +25,56 @@ class BaseExtractor(ABC):
 
 
 # ============================================================
-# UTB Extractor
+# CY (Coyote Logistics) Extractor
 # ============================================================
-class UTBExtractor(BaseExtractor):
-    """Extracts broker, carrier, pickup, and delivery data from USA Truck Brokers load confirmation text files."""
+class CYExtractor(BaseExtractor):
+    """
+    Extracts broker, carrier, stop, and charge data from
+    Coyote Logistics Rate Confirmation text files (markdown output
+    from pymupdf4llm / pdf_to_txt pipeline).
+    """
 
     def _normalize(self, text: str) -> str:
         if not text:
             return ""
-        text = re.sub(r"\*{2,}", "", text)
-        text = re.sub(r"PickUp\b", "Pickup", text, flags=re.I)
-        text = re.sub(r"Del\.\s*Date", "Delivery Date", text, flags=re.I)
-        text = re.sub(r"Miami Lake,s", "Miami Lakes", text, flags=re.I)
+        # Remove markdown bold/italic markers
+        text = re.sub(r"\*{1,3}", "", text)
+        # Normalize whitespace
         text = re.sub(r"[ \t\u00A0]+", " ", text)
         text = re.sub(r"\r\n?", "\n", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
-        text = re.sub(r"(?<=\w)\n(?=[A-Z0-9])", " ", text)
         text = "\n".join([ln.strip() for ln in text.splitlines() if ln.strip()])
         return text.strip()
 
-    def _combine_dt(self, date_str, time_str):
+    def _parse_scheduled(self, block: str):
+        """
+        Parses lines like:
+          'Wed 03/29/2023'  +  'from 08:00 - 13:00'   -> start / end datetime
+          'Thu 03/30/2023'  +  'at 09:30'              -> start datetime only
+        Returns (start_dt, end_dt) as ISO strings or ("", "").
+        """
+        date_m = re.search(r"(\d{2}/\d{2}/\d{4})", block)
+        if not date_m:
+            return "", ""
+        date_str = date_m.group(1)
+
+        range_m = re.search(r"from\s+(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})", block, re.I)
+        if range_m:
+            start = self._combine_dt(date_str, range_m.group(1))
+            end   = self._combine_dt(date_str, range_m.group(2))
+            return start, end
+
+        at_m = re.search(r"at\s+(\d{1,2}:\d{2})", block, re.I)
+        if at_m:
+            start = self._combine_dt(date_str, at_m.group(1))
+            return start, ""
+
+        return "", ""
+
+    def _combine_dt(self, date_str: str, time_str: str) -> str:
         if not date_str or not time_str:
             return ""
-        for fmt in [
-            "%m/%d/%Y %I:%M %p", "%m/%d/%Y %H:%M",
-            "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %H:%M:%S"
-        ]:
+        for fmt in ["%m/%d/%Y %H:%M", "%m/%d/%Y %I:%M %p"]:
             try:
                 dt = datetime.strptime(f"{date_str} {time_str}", fmt)
                 return dt.strftime("%Y-%m-%dT%H:%M:%S")
@@ -59,25 +82,26 @@ class UTBExtractor(BaseExtractor):
                 continue
         return ""
 
-    def _extract_stop_blocks(self, text: str, stop_type: str):
-        stop_type = stop_type.lower()
-        pattern = re.compile(rf"{stop_type.title()}\s*#\s*\d+", re.I)
-        markers = list(pattern.finditer(text))
-
-        if not markers:
-            alt = re.compile(
-                rf"{stop_type.title()}\b(.*?)(?=(Pickup|Delivery|Send Invoice|Total|$))",
-                re.I | re.S
-            )
-            return [m.group(1).strip() for m in alt.finditer(text)]
+    def _extract_stop_block(self, text: str, stop_label: str) -> list[str]:
+        """
+        Splits the text by 'Stop N: Pick Up' / 'Stop N: Delivery' headers
+        and returns only the blocks whose header matches stop_label (case-insensitive).
+        """
+        pattern = re.compile(
+            r"Stop\s+\d+\s*:\s*(" + re.escape(stop_label) + r")\b",
+            re.I
+        )
+        # Find all stop headers regardless of type so we can slice correctly
+        all_stops = re.compile(r"Stop\s+\d+\s*:\s*(?:Pick\s*Up|Delivery)\b", re.I)
+        markers = list(all_stops.finditer(text))
 
         blocks = []
         for i, m in enumerate(markers):
+            header_text = text[m.start(): m.end()]
             start = m.end()
-            end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
-            sub = text[start:end]
-            cutoff = re.search(r"(Send Invoice|Special Instructions|Total|Please Sign)", sub, re.I)
-            blocks.append(sub[:cutoff.start()].strip() if cutoff else sub.strip())
+            end   = markers[i + 1].start() if i + 1 < len(markers) else len(text)
+            if pattern.search(header_text):
+                blocks.append(text[start:end].strip())
         return blocks
 
     def extract(self, text: str) -> dict:
@@ -87,103 +111,186 @@ class UTBExtractor(BaseExtractor):
 
         text = self._normalize(text)
 
-        # -------- Broker Info --------
-        broker_chunk = re.search(r"Send Invoice to:(.*?)(?=Total Carrier Pay|Carrier\b|$)", text, re.I | re.S)
-        if broker_chunk:
-            btext = broker_chunk.group(1)
-
-            if m := re.search(r"(USA Truck Brokers Inc\.?)", btext, re.I):
-                data["broker_name"] = m.group(1).strip()
-
-            if m := re.search(r"Tel[:\s]*(\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{4})", btext, re.I):
-                data["broker_phone"] = m.group(1).strip()
-
-            if m := re.search(r"Fax[:\s]*(\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{4})", btext, re.I):
-                data["broker_fax"] = m.group(1).strip()
-
-            if emails := re.findall(r"[\w\.-]+@[\w\.-]+\.\w+", btext):
-                data["broker_email"] = "; ".join(sorted(set(emails)))
-
-            m = re.search(
-                r"(\d{1,6}\s+[A-Za-z0-9#.,\s]+?)\s*(?:\n|,)?\s*([A-Za-z\s]+),\s*([A-Z]{2})\s*(\d{5})",
-                btext, re.I
-            )
-            if m:
-                address = re.sub(r"\s+", " ", m.group(1).strip())
-                city = re.sub(r"\bLake,s\b", "Lakes", m.group(2), flags=re.I).strip()
-                data.update({
-                    "broker_address": address,
-                    "broker_city": city,
-                    "broker_state": m.group(3).strip(),
-                    "broker_zipcode": m.group(4).strip()
-                })
-
-        if m := re.search(r"Trip\s*#[:\s]*([A-Z0-9\-]+)", text, re.I):
+        # ── Load / Confirmation Number ──────────────────────────────────
+        if m := re.search(r"Load\s+(\d{6,12})\b", text, re.I):
             data["loadConfirmationNumber"] = m.group(1).strip()
 
-        if m := re.search(r"Total\s*(?:To\s*Pay|Carrier\s*Pay)[:\s\$]*([\d,]+\.\d{2})", text, re.I):
-            data["totalCarrierPay"] = m.group(1).replace(",", "").strip()
+        # ── Broker info (Coyote block near Agreement section) ───────────
+        broker_block = re.search(
+            r"Broker\s+([A-Za-z ,\.]+LLC[^\n]*)\n"
+            r"Rep\s+([A-Za-z\s]+)\n"
+            r"Title\s+([A-Za-z\s]+)\n"
+            r"Phone\s+([\+\d\s\(\)x]+)\n"
+            r"Fax\s+([\+\d\s\(\)]+)\n"
+            r"Date\s+([^\n]+)",
+            text, re.I
+        )
+        if broker_block:
+            data["broker_name"]  = broker_block.group(1).strip()
+            data["broker_rep"]   = broker_block.group(2).strip()
+            data["broker_phone"] = broker_block.group(4).strip()
+            data["broker_fax"]   = broker_block.group(5).strip()
 
-        # -------- Carrier info --------
+        # Broker email (appears near top)
+        if m := re.search(r"Send invoices to:.*?([\w\.\-]+@[\w\.\-]+\.\w+)", text, re.I | re.S):
+            data["broker_email"] = m.group(1).strip()
+
+        # Broker address block (960 Northpoint pattern)
+        if m := re.search(
+            r"(\d{3,5}\s+[A-Za-z0-9\s]+(?:Parkway|Ave|Blvd|St|Rd|Dr|Way)[^\n]*)\n"
+            r"(?:Suite\s*\d+\n)?"
+            r"([A-Za-z\s]+),\s*([A-Z]{2})\s*(\d{5})",
+            text, re.I
+        ):
+            data["broker_address"] = m.group(1).strip()
+            data["broker_city"]    = m.group(2).strip()
+            data["broker_state"]   = m.group(3).strip()
+            data["broker_zipcode"] = m.group(4).strip()
+
+        # Booked By (Coyote rep)
+        if m := re.search(r"Booked By\s*\n([A-Za-z\s]+)\n([\w\.\-]+@[\w\.\-]+\.\w+)", text, re.I):
+            data["broker_rep"]   = m.group(1).strip()
+            data["broker_email"] = m.group(2).strip()
+
+        # ── Carrier info ────────────────────────────────────────────────
         carrier_block = re.search(
-            r"Trailer VIN Number.*?Carrier\s+([A-Z0-9 &\.\-]+).*?"
-            r"MC\s*#[:\s]*(\d+).*?"
-            r"Address[:\s]*([0-9A-Za-z\s#.,\-]+).*?"
-            r"City[:\s]*([A-Za-z\s]+),\s*([A-Z]{2})\s*(\d{5}).*?"
-            r"Phone[:\s]*([\d\-\s\(\)]+).*?"
-            r"Fax[:\s]*([\d\-\s\(\)]*).*?"
-            r"Contact[:\s]*([A-Za-z\s\-\.,()]+?)(?=\s*(Truck VIN Number|Trailer VIN Number|Total|Please Sign|$))",
-            text, re.I | re.S
+            r"Carrier\s*\n([A-Za-z0-9\s&\.\,]+)\n"
+            r"USDOT\s+(\d+)\n"
+            r"Phone\s+([^\n]+)\n"
+            r"Email\s+([^\n]+)\n"
+            r"Fax\s+([^\n]*)",
+            text, re.I
         )
         if carrier_block:
-            data.update({
-                "carrier_name": carrier_block.group(1).strip(),
-                "carrier_mc": carrier_block.group(2).strip(),
-                "carrier_address": carrier_block.group(3).strip(),
-                "carrier_city": carrier_block.group(4).strip(),
-                "carrier_state": carrier_block.group(5).strip(),
-                "carrier_zipcode": carrier_block.group(6).strip(),
-                "carrier_phone": carrier_block.group(7).strip(),
-                "carrier_fax": carrier_block.group(8).strip(),
-                "carrier_contact": carrier_block.group(9).strip()
-            })
+            data["carrier_name"]  = carrier_block.group(1).strip()
+            data["carrier_usdot"] = carrier_block.group(2).strip()
+            data["carrier_phone"] = carrier_block.group(3).strip()
+            data["carrier_email"] = carrier_block.group(4).strip()
+            data["carrier_fax"]   = carrier_block.group(5).strip()
 
-        # -------- Pickups --------
-        pickups = self._extract_stop_blocks(text, "pickup")
-        for i, block in enumerate(pickups[:3], start=1):
-            if m := re.search(r"Customer[:\s]*([A-Z0-9 &\.\-]+?)(?=\s*(Pick.?Up|Address|City|Zip|Phone|$))", block, re.I):
+        # Carrier from signature footer  [Carrier Legal Name - ...]
+        if not data["carrier_name"]:
+            if m := re.search(r"\[Carrier Legal Name\s*-\s*([^\]]+)\]", text, re.I):
+                data["carrier_name"] = m.group(1).strip()
+        if not data["carrier_usdot"]:
+            if m := re.search(r"\[Carrier USDOT\s*-\s*([^\]]+)\]", text, re.I):
+                data["carrier_usdot"] = m.group(1).strip()
+
+        # Equipment type
+        if m := re.search(r"Equipment\s+([^\n]+)", text, re.I):
+            data["equipment_type"] = m.group(1).strip()
+
+        # ── Charges ─────────────────────────────────────────────────────
+        if m := re.search(r"Total\s+USD\s+\$?([\d,]+\.\d{2})", text, re.I):
+            data["totalCarrierPay"] = m.group(1).replace(",", "").strip()
+
+        # Flat rate line
+        if m := re.search(r"Flat Rate\s+[\d\.]+\s+\$?([\d,]+\.\d+)\s+\$?([\d,]+\.\d{2})", text, re.I):
+            data["flat_rate_amount"] = m.group(2).replace(",", "").strip()
+
+        # Fuel surcharge
+        if m := re.search(r"Fuel Surcharge\s+([\d\.]+)\s+\$?([\d\.]+)\s+\$?([\d,]+\.\d{2})", text, re.I):
+            data["fuel_surcharge_units"]  = m.group(1).strip()
+            data["fuel_surcharge_per"]    = m.group(2).strip()
+            data["fuel_surcharge_amount"] = m.group(3).replace(",", "").strip()
+
+        # ── Pick Up stops (up to 3) ──────────────────────────────────────
+        pickup_blocks = self._extract_stop_block(text, "Pick Up")
+        for i, block in enumerate(pickup_blocks[:3], start=1):
+
+            if m := re.search(r"Facility\s+([^\n]+)", block, re.I):
                 data[f"pickup_customer_{i}"] = m.group(1).strip()
-            if m := re.search(r"Address\s*#1[:\s]*([0-9A-Za-z\.,#\-\s]+?)(?:\n|Pick(?:up)?\s*Time|$)", block, re.I):
-                data[f"pickup_address_{i}"] = m.group(1).strip()
-            if m := re.search(r"City[:\s]*([A-Za-z\s]+),\s*([A-Z]{2})", block, re.I):
-                data[f"pickup_city_{i}"] = m.group(1).strip()
-                data[f"pickup_state_{i}"] = m.group(2).strip()
-            if m := re.search(r"Zip(?:\s*Code)?[:\s]*([0-9]{5})", block, re.I):
-                data[f"pickup_zipcode_{i}"] = m.group(1).strip()
-            date_m = re.search(r"Pick(?:up)?\s*Date[:\s]*([0-9/]+)", block, re.I)
-            times_m = re.search(r"(?:Pick(?:up)?\s*Time|Time)[:\s]*([0-9:]+)\s*-\s*([0-9:]+)", block, re.I)
-            if date_m and times_m:
-                data[f"pickup_start_datetime_{i}"] = self._combine_dt(date_m.group(1), times_m.group(1))
-                data[f"pickup_end_datetime_{i}"] = self._combine_dt(date_m.group(1), times_m.group(2))
 
-        # -------- Deliveries --------
-        deliveries = self._extract_stop_blocks(text, "delivery")
-        for i, block in enumerate(deliveries[:3], start=1):
-            if m := re.search(r"Customer[:\s]*([A-Z0-9 &\.\-]+?)(?=\s*(Delivery|Address|City|Zip|Phone|$))", block, re.I):
+            # Address: may span 2 lines before a city line
+            addr_m = re.search(
+                r"Address\s+([\w\s#,\.\-]+?)\n([A-Za-z\s]+),\s*([A-Z]{2})\s+(\d{5})",
+                block, re.I
+            )
+            if addr_m:
+                data[f"pickup_address_{i}"] = re.sub(r"\s+", " ", addr_m.group(1)).strip()
+                data[f"pickup_city_{i}"]    = addr_m.group(2).strip()
+                data[f"pickup_state_{i}"]   = addr_m.group(3).strip()
+                data[f"pickup_zipcode_{i}"] = addr_m.group(4).strip()
+            else:
+                # Fallback: address without zip on same block
+                if m := re.search(r"Address\s+(.+)", block, re.I):
+                    data[f"pickup_address_{i}"] = m.group(1).strip()
+                if m := re.search(r"([A-Za-z\s]+),\s*([A-Z]{2})\s+(\d{5})", block, re.I):
+                    data[f"pickup_city_{i}"]    = m.group(1).strip()
+                    data[f"pickup_state_{i}"]   = m.group(2).strip()
+                    data[f"pickup_zipcode_{i}"] = m.group(3).strip()
+
+            if m := re.search(r"Phone\s+([\+\d\s\(\)x]+)", block, re.I):
+                data[f"pickup_phone_{i}"] = m.group(1).strip()
+
+            sched_m = re.search(r"Scheduled For\s*\n(.*?)(?=\n\S|\Z)", block, re.I | re.S)
+            if sched_m:
+                start_dt, end_dt = self._parse_scheduled(sched_m.group(1))
+                data[f"pickup_start_datetime_{i}"] = start_dt
+                data[f"pickup_end_datetime_{i}"]   = end_dt
+
+            # PO numbers
+            if m := re.search(r"Pick\s*Up\s*Numbers?\s*\n([^\n]+)", block, re.I):
+                data[f"pickup_po_{i}"] = m.group(1).strip()
+
+            # Commodity / weight / pieces
+            comm_m = re.search(
+                r"Commodity\s+Exp Wt\s+Pieces\s*\n([^\n]+)\s+([\d,]+)\s+Lbs\s+(\d+)",
+                block, re.I
+            )
+            if comm_m:
+                data[f"pickup_commodity_{i}"] = comm_m.group(1).strip()
+                data[f"pickup_weight_{i}"]    = comm_m.group(2).replace(",", "").strip()
+                data[f"pickup_pieces_{i}"]    = comm_m.group(3).strip()
+
+        # ── Delivery stops (up to 3) ─────────────────────────────────────
+        delivery_blocks = self._extract_stop_block(text, "Delivery")
+        for i, block in enumerate(delivery_blocks[:3], start=1):
+
+            if m := re.search(r"Facility\s+([^\n]+)", block, re.I):
                 data[f"delivery_customer_{i}"] = m.group(1).strip()
-            if m := re.search(r"Address\s*#1[:\s]*([0-9A-Za-z\.,#\-\s]+)", block, re.I):
-                val = re.sub(r"\bDelivery\s*Time[:\s]*[0-9: -ETapm]*", "", m.group(1), flags=re.I).strip()
-                data[f"delivery_address_{i}"] = val
-            if m := re.search(r"City[:\s]*([A-Za-z\s]+),\s*([A-Z]{2})", block, re.I):
-                data[f"delivery_city_{i}"] = m.group(1).strip()
-                data[f"delivery_state_{i}"] = m.group(2).strip()
-            if m := re.search(r"Zip(?:\s*Code)?[:\s]*([0-9]{5})", block, re.I):
-                data[f"delivery_zipcode_{i}"] = m.group(1).strip()
-            date_m = re.search(r"Delivery\s*Date[:\s]*([0-9/]+)", block, re.I)
-            times_m = re.search(r"(?:Delivery\s*Time|Time)[:\s]*([0-9:]+)\s*-\s*([0-9:]+)", block, re.I)
-            if date_m and times_m:
-                data[f"delivery_start_datetime_{i}"] = self._combine_dt(date_m.group(1), times_m.group(1))
-                data[f"delivery_end_datetime_{i}"] = self._combine_dt(date_m.group(1), times_m.group(2))
+
+            addr_m = re.search(
+                r"Address\s+([\w\s#,\.\-]+?)\n([A-Za-z\s]+),\s*([A-Z]{2})\s*\n?(\d{5}(?:-\d{4})?)",
+                block, re.I
+            )
+            if addr_m:
+                data[f"delivery_address_{i}"] = re.sub(r"\s+", " ", addr_m.group(1)).strip()
+                data[f"delivery_city_{i}"]    = addr_m.group(2).strip()
+                data[f"delivery_state_{i}"]   = addr_m.group(3).strip()
+                data[f"delivery_zipcode_{i}"] = addr_m.group(4)[:5].strip()
+            else:
+                if m := re.search(r"Address\s+(.+)", block, re.I):
+                    data[f"delivery_address_{i}"] = m.group(1).strip()
+                if m := re.search(r"([A-Za-z\s]+),\s*([A-Z]{2})\s*\n?(\d{5})", block, re.I):
+                    data[f"delivery_city_{i}"]    = m.group(1).strip()
+                    data[f"delivery_state_{i}"]   = m.group(2).strip()
+                    data[f"delivery_zipcode_{i}"] = m.group(3).strip()
+
+            if m := re.search(r"Phone\s+([\+\d\s\(\)x]+)", block, re.I):
+                data[f"delivery_phone_{i}"] = m.group(1).strip()
+
+            sched_m = re.search(
+                r"(?:Appointment\s+)?Scheduled For\s*\n(.*?)(?=\n\S|\Z)",
+                block, re.I | re.S
+            )
+            if sched_m:
+                start_dt, end_dt = self._parse_scheduled(sched_m.group(1))
+                data[f"delivery_start_datetime_{i}"] = start_dt
+                data[f"delivery_end_datetime_{i}"]   = end_dt
+
+            # PO / Delivery numbers
+            if m := re.search(r"Delivery\s*Numbers?\s*\n([^\n]+)", block, re.I):
+                data[f"delivery_po_{i}"] = m.group(1).strip()
+
+            comm_m = re.search(
+                r"Commodity\s+Exp Wt\s+Pieces\s*\n([^\n]+)\s+([\d,]+)\s+Lbs\s+(\d+)",
+                block, re.I
+            )
+            if comm_m:
+                data[f"delivery_commodity_{i}"] = comm_m.group(1).strip()
+                data[f"delivery_weight_{i}"]    = comm_m.group(2).replace(",", "").strip()
+                data[f"delivery_pieces_{i}"]    = comm_m.group(3).strip()
 
         return data
 
@@ -192,33 +299,42 @@ class UTBExtractor(BaseExtractor):
 # Schema fields
 # ============================================================
 EXTRACTION_FIELDS = [
-    "broker_name", "broker_phone", "broker_fax", "broker_address",
-    "broker_city", "broker_state", "broker_zipcode", "broker_email",
-    "loadConfirmationNumber", "totalCarrierPay",
-    "carrier_name", "carrier_mc", "carrier_address", "carrier_city",
-    "carrier_state", "carrier_zipcode", "carrier_phone",
-    "carrier_fax", "carrier_contact",
+    # Broker
+    "broker_name", "broker_rep", "broker_phone", "broker_fax",
+    "broker_email", "broker_address", "broker_city", "broker_state", "broker_zipcode",
+    # Load
+    "loadConfirmationNumber", "equipment_type",
+    # Carrier
+    "carrier_name", "carrier_usdot", "carrier_phone", "carrier_email", "carrier_fax",
+    # Charges
+    "totalCarrierPay", "flat_rate_amount",
+    "fuel_surcharge_units", "fuel_surcharge_per", "fuel_surcharge_amount",
+    # Pickups x3
     *[f"{p}_{i}" for p in [
-        "pickup_customer", "pickup_address", "pickup_city",
-        "pickup_state", "pickup_zipcode",
-        "pickup_start_datetime", "pickup_end_datetime"
+        "pickup_customer", "pickup_address", "pickup_city", "pickup_state",
+        "pickup_zipcode", "pickup_phone", "pickup_po",
+        "pickup_start_datetime", "pickup_end_datetime",
+        "pickup_commodity", "pickup_weight", "pickup_pieces",
     ] for i in range(1, 4)],
+    # Deliveries x3
     *[f"{p}_{i}" for p in [
-        "delivery_customer", "delivery_address", "delivery_city",
-        "delivery_state", "delivery_zipcode",
-        "delivery_start_datetime", "delivery_end_datetime"
+        "delivery_customer", "delivery_address", "delivery_city", "delivery_state",
+        "delivery_zipcode", "delivery_phone", "delivery_po",
+        "delivery_start_datetime", "delivery_end_datetime",
+        "delivery_commodity", "delivery_weight", "delivery_pieces",
     ] for i in range(1, 4)],
-    "processed_at"
+    "processed_at",
 ]
+
 
 # ============================================================
 # Spark UDF wrapper
 # ============================================================
 def extract_fields_udf():
-    extractor = UTBExtractor()
+    extractor = CYExtractor()
 
     def _extract(text):
-        result = extractor.extract(text)
+        result = extractor.extract(text or "")
         result["processed_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
         return result
 
@@ -226,11 +342,11 @@ def extract_fields_udf():
 
 
 # ============================================================
-# Main (parameterized)
+# Main
 # ============================================================
 def main(p):
-    spark = SparkSession.builder.appName("TruckR Extraction").getOrCreate()
-    logger.info("Starting UTB extraction process")
+    spark = SparkSession.builder.appName("TruckR CY Extraction").getOrCreate()
+    logger.info("Starting CY (Coyote) extraction process")
 
     input_path = os.path.join(p["source_path"], "*.txt")
     df = (
@@ -260,17 +376,16 @@ def main(p):
         .saveAsTable(p["target_table"])
     )
 
-    logger.info("UTB extraction completed successfully.")
+    logger.info("CY extraction completed successfully.")
 
 
 # ============================================================
 # CLI entry
 # ============================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="UTB PDF Extraction Parameters")
-    parser.add_argument("--source_path")
-    parser.add_argument("--target_table")
+    parser = argparse.ArgumentParser(description="CY PDF Extraction Parameters")
+    parser.add_argument("--source_path", required=True)
+    parser.add_argument("--target_table", required=True)
     args = parser.parse_args()
 
-    params = {"source_path": args.source_path, "target_table": args.target_table}
-    main(params)
+    main({"source_path": args.source_path, "target_table": args.target_table})

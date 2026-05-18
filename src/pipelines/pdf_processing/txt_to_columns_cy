@@ -51,7 +51,7 @@ class CYExtractor(BaseExtractor):
         text = re.sub(r"\*{1,3}", "", text)
         text = re.sub(r"[ \t\u00A0]+", " ", text)
         text = re.sub(r"\r\n?", "\n", text)
-        text = re.sub(r"\n{3,}", "\n\n", text)
+        text = re.sub(r"\n{2,}", "\n", text)
         text = "\n".join([ln.strip() for ln in text.splitlines() if ln.strip()])
         return text.strip()
 
@@ -93,7 +93,7 @@ class CYExtractor(BaseExtractor):
                 if not ln:
                     continue
                 if self._STOP.match(ln):
-                    break
+                    break          # stop word → don't append, return as-is
                 candidate = candidate + " " + ln
                 break
             return candidate
@@ -191,6 +191,22 @@ class CYExtractor(BaseExtractor):
             data["loadConfirmationNumber"] = m.group(1).strip()
 
         # Broker
+        if m := re.search(r"Send invoices to:\s*\n([\w\.\-]+@[\w\.\-]+\.\w+)", text, re.I):
+            data["broker_email"] = m.group(1).strip()
+ 
+        if m := re.search(
+            r"(\d{3,5}\s+[A-Za-z0-9\s]+(?:Parkway|Ave|Blvd|St|Rd|Dr|Way)[^\n]*)\n"
+            r"(?:Suite\s*\d+\n)?([A-Za-z\s]+),\s*([A-Z]{2})\s*(\d{5})",
+            text, re.I
+        ):
+            data["broker_address"] = m.group(1).strip()
+            data["broker_city"]    = m.group(2).strip()
+            data["broker_state"]   = m.group(3).strip()
+            data["broker_zipcode"] = m.group(4).strip()
+ 
+        if m := re.search(r"Booked By\s*\n([A-Za-z\s]+)\n", text, re.I):
+            data["broker_rep"] = m.group(1).strip()
+
         broker_block = re.search(
             r"Broker\s+([A-Za-z ,\.]+LLC[^\n]*)\n"
             r"Rep\s+([A-Za-z\s]+)\n"
@@ -276,7 +292,8 @@ class CYExtractor(BaseExtractor):
                 data[f"pickup_start_datetime_{i}"] = s
                 data[f"pickup_end_datetime_{i}"]   = e
             data[f"pickup_po_{i}"] = self._extract_po(block, "Pick Up")
-            cm = re.search(r"Commodity\s+\S+\s+\S+\s*\n([^\n]+?)\s+([\d,]+)\s+Lbs", block, re.I)
+
+            cm = re.search(r"Commodity[^\n]+\n([^\n]+?)\s+([\d,]+)\s+Lbs", block, re.I)
             if cm:
                 data[f"pickup_commodity_{i}"] = cm.group(1).strip()
                 data[f"pickup_weight_{i}"]    = cm.group(2).replace(",", "").strip()

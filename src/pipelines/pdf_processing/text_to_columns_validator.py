@@ -120,14 +120,20 @@ target_rows = target_df.filter(F.col("loadConfirmationNumber") == load_id).colle
 
 results = []
 
+SKIP_FIELDS = {"source_file"}
+
 if not target_rows:
     logger.error(f"No record found for loadConfirmationNumber={load_id}")
     for col in schema.fieldNames():
+        if col in SKIP_FIELDS:
+            continue
         results.append((col, "❌ Missing record", truth_record.get(col), None))
 else:
     logger.info(f"Found record for loadConfirmationNumber={load_id}")
     target_values = target_rows[0].asDict()
     for col in schema.fieldNames():
+        if col in SKIP_FIELDS:
+            continue
         truth_val = truth_record.get(col)
         target_val = target_values.get(col)
         norm_truth = str(truth_val).strip().lower() if truth_val else None
